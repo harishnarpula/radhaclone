@@ -1,0 +1,63 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: jdbc:postgresql://dpg-d8470ofaqgkc73adpk6g-a.oregon-postgres.render.com:5432/radha_ai
+    username: radha_ai_user
+    password: vKfXPbeFasUD1PwLSmwQDAPTpka0kTX1
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+
+    show-sql: false
+    open-in-view: false
+
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+  servlet:
+    multipart:
+      max-file-size: 500MB
+      max-request-size: 500MB
+
+  ai:
+    # Anthropic DISABLED — no credits
+    anthropic:
+      api-key: DISABLED
+
+    # OpenAI — used for BOTH chat AND embeddings
+    openai:
+      api-key: ${OPENAI_API_KEY}
+      chat:
+        options:
+          model: gpt-4o-mini
+          max-tokens: 4096
+      embedding:
+        options:
+          model: text-embedding-3-small
+
+    vectorstore:
+      qdrant:
+        host: ${QDRANT_HOST}
+        port: ${QDRANT_PORT}
+        api-key: ${QDRANT_API_KEY}
+        collection-name: askoxy
+        use-tls: true
+
+management:
+  health:
+    redis:
+      enabled: false
+
+logging:
+  level:
+    com.askoxy.radhaai: INFO
+
+radha:
+  n8n:
+    enabled: false
+    webhook-base-url: http://localhost:5678/webhook
