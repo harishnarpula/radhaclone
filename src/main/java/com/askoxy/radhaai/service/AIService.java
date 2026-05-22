@@ -56,7 +56,22 @@ public class AIService {
                     ex);
         }
     }
-
+    // AFTER:
+    public String chat(String prompt) {
+        log.info("Sending chat request to AI");
+        try {
+            String response = chatClient.prompt()
+                    .user(prompt)
+                    .call()
+                    .content();
+            log.info("Chat completion successful: {} chars",
+                    response != null ? response.length() : 0);
+            return response != null ? response : "";
+        } catch (Exception ex) {
+            log.error("Chat completion failed", ex);
+            throw new RuntimeException("AI chat generation failed: " + ex.getMessage(), ex);
+        }
+    }
     // ─────────────────────────────────────────────────────────────────────────
     // WHISPER AUDIO TRANSCRIPTION
     // ─────────────────────────────────────────────────────────────────────────
@@ -80,7 +95,7 @@ public class AIService {
             MultiValueMap<String, Object> body =
                     new LinkedMultiValueMap<>();
 
-            body.add("model", "whisper-1");
+            body.add("model", "gpt-4o-transcribe");  // was "whisper-1"
 
             body.add("file", new ByteArrayResource(bytes) {
 
@@ -162,7 +177,7 @@ public class AIService {
                     """;
 
             Map<String, Object> payload = Map.of(
-                    "model", "gpt-4o-mini",
+                    "model", "gpt-4.1-mini",
                     "messages", List.of(
                             Map.of(
                                     "role", "user",
@@ -227,5 +242,120 @@ public class AIService {
 
             return "";
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+// DALL-E IMAGE GENERATION
+// ─────────────────────────────────────────────────────────────────────────
+
+    public String generateImage(String prompt) {
+
+        log.info(
+                "Generating image via DALL-E 3: {}",
+                prompt.substring(0, Math.min(prompt.length(), 80))
+        );
+
+        try {
+
+            Map<String, Object> payload = Map.of(
+                    "model", "gpt-image-1",
+                    "prompt", prompt,
+                    "size", "1024x1024",
+                    "quality", "medium"
+            );
+            HttpHeaders headers = new HttpHeaders();
+
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            headers.setBearerAuth(openAiApiKey);
+
+            RestTemplate restTemplate = new RestTemplate();
+
+            ResponseEntity<Map> response =
+                    restTemplate.exchange(
+                            "https://api.openai.com/v1/images/generations",
+                            HttpMethod.POST,
+                            new HttpEntity<>(payload, headers),
+                            Map.class
+                    );
+
+            List<Map<String, Object>> data =
+                    (List<Map<String, Object>>)
+                            response.getBody().get("data");
+
+            String base64Image =
+                    (String) data.get(0).get("b64_json");
+
+            byte[] imageBytes =
+                    java.util.Base64.getDecoder()
+                            .decode(base64Image);
+
+            String fileName =
+                    java.util.UUID.randomUUID() + ".png";
+
+            java.nio.file.Path path =
+                    java.nio.file.Paths.get(
+                            "uploads/images/" + fileName);
+
+            java.nio.file.Files.createDirectories(path.getParent());
+
+            java.nio.file.Files.write(path, imageBytes);
+
+            String imageUrl =
+                    "/uploads/images/" + fileName;
+
+
+
+            log.info("Image generated successfully: {}", imageUrl);
+
+            return imageUrl;
+
+        } catch (Exception ex) {
+
+            log.error("Image generation failed", ex);
+
+            throw new RuntimeException(
+                    "Image generation failed: "
+                            + ex.getMessage(),
+                    ex
+            );
+        }
+    }
+
+    public String buildImagePrompt(
+            String generatedContent,
+            String platformLabel) {
+
+        String system = """
+        You are an expert at writing DALL-E prompts.
+
+        Rules:
+        - professional social media image
+        - corporate modern style
+        - no text in image
+        - no words
+        - no letters
+        - eye catching
+        - clean visual
+        - business quality
+        - return ONLY prompt
+        """;
+
+        String user = """
+        Platform: %s
+
+        Content:
+        %s
+
+        Create a DALL-E prompt.
+        """.formatted(
+                platformLabel,
+                generatedContent.substring(
+                        0,
+                        Math.min(generatedContent.length(), 500)
+                )
+        );
+
+        return chat(system, user);
     }
 }

@@ -2,6 +2,7 @@ package com.askoxy.radhaai.service;
 
 import com.askoxy.radhaai.dto.UploadResponse;
 import com.askoxy.radhaai.entity.UploadedFile;
+import com.askoxy.radhaai.enums.FileType;
 import com.askoxy.radhaai.enums.PlatformType;
 import com.askoxy.radhaai.enums.UploadStatus;
 import com.askoxy.radhaai.repository.UploadedFileRepository;
@@ -13,6 +14,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 
 /**
@@ -31,6 +35,7 @@ public class IngestionService {
 
     private static final int BATCH_SIZE = 10;
     private static final String KNOWLEDGE_TYPE = "COMPANY_KNOWLEDGE";
+    private static final String UPLOAD_DIR = "uploads/company/";
 
     @Transactional
     public UploadResponse upload(MultipartFile file, PlatformType platformType, String description) {
@@ -56,8 +61,28 @@ public class IngestionService {
         uploadedFileRepository.save(record);
 
         try {
-            // STEP 1 — Extract
             updateStatus(record, UploadStatus.PROCESSING);
+
+            // STEP 1 — For IMAGE and AUDIO: save file to disk so path is available
+            // For all other types: no disk save needed (text extracted directly)
+            // For IMAGE/AUDIO: save to disk first, wrap in try/catch (throws Exception)
+            String savedFilePath = null;
+            FileType detectedType = documentService.detectFileType(file);
+            if (detectedType == FileType.IMAGE || detectedType == FileType.AUDIO) {
+                try {
+                    savedFilePath = saveFileToDisk(file, fileId);
+                    log.info("File saved to disk: {}", savedFilePath);
+                } catch (Exception diskEx) {
+                    log.warn("File save to disk failed — continuing without path: {}", diskEx.getMessage());
+                }
+            }
+            // final copy required for use inside lambda expression
+            final String finalFilePath = savedFilePath;
+
+            // STEP 2 — Extract text content
+            // IMAGE  → GPT-4 Vision reads visible text/banners/content from image
+            // AUDIO  → Whisper transcribes speech to text
+            // Others → existing extractors unchanged (PDF, DOCX, CSV, etc.)
             String text = documentService.extractText(file);
             updateStatus(record, UploadStatus.EXTRACTED);
 
@@ -76,6 +101,12 @@ public class IngestionService {
                         meta.put("vectorStoreId", vectorStoreId);
                         meta.put("knowledgeType", KNOWLEDGE_TYPE);
                         meta.put("clientName", platformType.name());
+                        meta.put("fileType", fileType);
+                        meta.put("fileName", file.getOriginalFilename());
+                        // For IMAGE and AUDIO, store file path in metadata
+                        if (finalFilePath != null) {
+                            meta.put("filePath", finalFilePath);
+                        }
                         return new Document(c.text(), meta);
                     }).toList();
 
@@ -140,4 +171,23 @@ public class IngestionService {
             out.add(list.subList(i, Math.min(i + size, list.size())));
         return out;
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Save IMAGE or AUDIO file to disk during company upload
+    // Path stored in Qdrant metadata for future reference
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private String saveFileToDisk(MultipartFile file, String fileId) throws Exception {
+        Path dir = Paths.get(UPLOAD_DIR);
+        if (!Files.exists(dir)) Files.createDirectories(dir);
+        String ext = "";
+        String originalName = file.getOriginalFilename();
+        if (originalName != null && originalName.contains(".")) {
+            ext = originalName.substring(originalName.lastIndexOf("."));
+        }
+        Path target = dir.resolve(fileId + ext);
+        Files.write(target, file.getBytes());
+        return target.toString();
+    }
+
 }

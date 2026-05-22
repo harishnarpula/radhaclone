@@ -9,15 +9,19 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.*;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.client.RestTemplate;
 import org.springframework.web.multipart.MultipartFile;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @Slf4j
 @Service
@@ -31,81 +35,194 @@ public class ContentService {
     private final VectorStore vectorStore;
     private final ObjectMapper objectMapper;
 
-    @Value("${radha.n8n.webhook-base-url:http://localhost:5678/webhook}")
-    private String n8nWebhookBaseUrl;
+    private static final String REASONING_SYSTEM = """
+            You are an expert content strategist and editor for AskOxy Group.
 
-    @Value("${radha.n8n.enabled:false}")
-    private boolean n8nEnabled;
+            Your job is to:
+            1. READ the raw CEO input carefully — it may come from voice transcription
+               or quick typing and MAY contain spelling mistakes, grammar errors,
+               or unclear phrasing.
+            2. CORRECT all spelling mistakes, grammar errors, and unclear phrasing.
+            3. EXTRACT the core business idea(s) clearly.
+            4. DECIDE if all ideas are about the same topic (sameTopicGroup=true)
+               or multiple different topics (sameTopicGroup=false).
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // SUBMIT
-    // ─────────────────────────────────────────────────────────────────────────
+            Return ONLY valid JSON — no explanation, no markdown, no extra text:
+            {
+              "cleanedIdea": "corrected and clarified version of the CEO input",
+              "sameTopicGroup": true
+            }
+
+            Rules for cleanedIdea:
+            - Fix ALL spelling mistakes (especially from voice: "oxyloanz" → "OxyLoans")
+            - Fix grammar but KEEP the original meaning
+            - Keep business terms exact: OxyLoans, OxyGold.ai, OxyBricks, AskOxy.AI,
+              StudyAbroad, OxyGlobal, Radha Sir, AskOxy Group
+            - If input mentions multiple unrelated topics → sameTopicGroup: false
+            - If input is about one topic or closely related topics → sameTopicGroup: true
+            """;
+
+    private static final String GENERATION_SYSTEM_GROUPED = """
+            You are an expert content writer for AskOxy Group, writing on behalf of
+            Radha Krishna Thatavrthi, CEO & Founder.
+
+            Generate rich, professional business content based on the CEO's idea.
+            Use the provided knowledge base context to add accurate facts and details.
+
+            SPELLING & GRAMMAR RULES (critical):
+            - Zero spelling mistakes allowed in the output
+            - Zero grammar mistakes allowed in the output
+            - Business terms must be exact: OxyLoans, OxyGold.ai, OxyBricks,
+              AskOxy.AI, StudyAbroad, OxyGlobal, Radha Sir, AskOxy Group
+            - Numbers and percentages must be accurate — do NOT invent statistics
+            - If a fact is not in the knowledge base, do NOT include it
+
+            CONTENT RULES:
+            - Tone: confident, professional, warm — as Radha Sir would speak
+            - First person: "We at OxyLoans..." or "I'm proud to announce..."
+            - Value-driven: always explain what benefit the user gets
+            - Avoid corporate jargon — write simply and clearly
+
+            Return ONLY valid JSON — no explanation, no markdown fences:
+            {
+              "title": "compelling headline — 6-12 words",
+              "summary": "2-3 sentence overview of what this content is about",
+              "intro": "1-2 sentence hook that grabs attention",
+              "body": "main content — 150 to 300 words — well written, zero errors, first person as Radha Sir",
+              "closing": "1-2 sentence strong closing thought",
+              "isGrouped": true
+            }
+            """;
+
+    private static final String GENERATION_SYSTEM_SEPARATE = """
+            You are an expert content writer for AskOxy Group, writing on behalf of
+            Radha Krishna Thatavrthi, CEO & Founder.
+
+            The CEO has given input covering MULTIPLE different topics.
+            Generate separate focused content for each topic.
+            Use the knowledge base context to add accurate facts.
+
+            SPELLING & GRAMMAR RULES (critical):
+            - Zero spelling mistakes allowed in the output
+            - Zero grammar mistakes allowed in the output
+            - Business terms must be exact: OxyLoans, OxyGold.ai, OxyBricks,
+              AskOxy.AI, StudyAbroad, OxyGlobal, Radha Sir, AskOxy Group
+            - Do NOT invent statistics or facts not in the knowledge base
+
+            CONTENT RULES:
+            - Tone: confident, professional, warm — as Radha Sir would speak
+            - First person: "We at OxyLoans..." or "I believe..."
+            - Each section should stand alone as a complete piece of content
+            - 100-200 words per section
+
+            Return ONLY valid JSON — no explanation, no markdown fences:
+            {
+              "title": "overall theme title — 6-12 words",
+              "summary": "2-3 sentence overview connecting all topics",
+              "intro": "1-2 sentence overall hook",
+              "body": "brief intro connecting all topics — 80-120 words, first person as Radha Sir",
+              "sections": [
+                {
+                  "heading": "Topic 1 title",
+                  "content": "Topic 1 content — 100-200 words, zero errors, first person as Radha Sir"
+                }
+              ],
+              "closing": "1-2 sentence strong closing thought from Radha Sir",
+              "isGrouped": false
+            }
+            """;
 
     @Transactional
     public ContentItem submit(ContentRequest req) throws Exception {
 
         log.info("Content pipeline started — platform={}", req.getPlatform());
 
-        // ── Collect inputs cleanly — no labels ──────────────────────────────
-
-        // Text
         String textInput = "";
         if (req.getRawInstruction() != null && !req.getRawInstruction().isBlank())
             textInput = normalizeText(req.getRawInstruction());
 
-        // Voice → transcribe
         String voiceInput = "";
         if (req.getVoiceFile() != null && !req.getVoiceFile().isEmpty()) {
-            log.info("Transcribing voice file via Whisper");
+            log.info("Transcribing voice file");
             voiceInput = normalizeText(aiService.transcribe(req.getVoiceFile()));
             log.info("VOICE TRANSCRIPT:\n{}", voiceInput);
         }
 
-        // File → AI smart summary (NOT raw dump)
         String fileInput = "";
         if (req.getAttachment() != null && !req.getAttachment().isEmpty()) {
             fileInput = smartSummarizeFile(req.getAttachment());
-            log.info("FILE SMART SUMMARY:\n{}", fileInput);
+            log.info("FILE SUMMARY:\n{}", fileInput);
+        }
+
+        String imageUrl = null;
+        if (req.getAttachment() != null && !req.getAttachment().isEmpty()) {
+            String name = req.getAttachment().getOriginalFilename().toLowerCase();
+            if (name.endsWith(".png") || name.endsWith(".jpg")
+                    || name.endsWith(".jpeg") || name.endsWith(".webp")) {
+                String filename = UUID.randomUUID() + "_" + req.getAttachment().getOriginalFilename();
+                Path savePath = Paths.get("uploads/" + filename);
+                Files.createDirectories(savePath.getParent());
+                req.getAttachment().transferTo(savePath);
+                imageUrl = "/uploads/" + filename;
+                log.info("Image saved: {}", imageUrl);
+            }
         }
 
         if (textInput.isEmpty() && voiceInput.isEmpty() && fileInput.isEmpty())
-            throw new IllegalArgumentException(
-                    "No input provided — please send text, voice, image, audio, or attachment.");
+            throw new IllegalArgumentException("No input provided.");
 
-        // Combine cleanly — no labels
-        StringBuilder combined = new StringBuilder();
-        if (!textInput.isEmpty())  combined.append(textInput).append("\n\n");
-        if (!voiceInput.isEmpty()) combined.append(voiceInput).append("\n\n");
-        if (!fileInput.isEmpty())  combined.append(fileInput);
+        String finalInstruction = Stream.of(textInput, voiceInput, fileInput)
+                .filter(s -> !s.isEmpty())
+                .collect(Collectors.joining("\n\n"))
+                .trim();
 
-        String finalInstruction = combined.toString().trim();
-        log.info("FINAL COMBINED INPUT:\n{}", finalInstruction);
+        log.info("FINAL INPUT:\n{}", finalInstruction);
 
-        // For UI/DB — store only CEO's original clean text, not file dump
         String rawInstructionForStorage = !textInput.isEmpty() ? textInput
-                : !voiceInput.isEmpty() ? voiceInput : "(file input only)";
+                : !voiceInput.isEmpty() ? voiceInput
+                : "(file input only)";
 
-        String platformLabel = resolvePlatformLabel(
-                req.getPlatform(),
-                req.getCustomPlatformName());
+        String platformLabel = resolvePlatformLabel(req.getPlatform(), req.getCustomPlatformName());
 
-        // STEP 1 — REASONING + TOPIC CLASSIFICATION
         String cleanedIdeaJson = reasonInstruction(finalInstruction, platformLabel);
-        log.info("CLEANED IDEA JSON:\n{}", cleanedIdeaJson);
-
         boolean sameTopicGroup = extractSameTopicGroup(cleanedIdeaJson);
-        log.info("sameTopicGroup={} platform={}", sameTopicGroup, platformLabel);
+        log.info("Reasoning complete — sameTopicGroup={}", sameTopicGroup);
 
-        // STEP 2 — PLATFORM-FILTERED RAG
-        String ragContext = retrieve(cleanedIdeaJson, 5, platformLabel);
-        log.info("RAG CONTEXT:\n{}", ragContext);
+        String ragContext = retrieveWithFallback(cleanedIdeaJson, 5, platformLabel);
 
-        // STEP 3 — GENERATION (branched by topic classification)
         String generatedJson = sameTopicGroup
                 ? generateGroupedContent(cleanedIdeaJson, platformLabel, ragContext)
                 : generateSeparateContent(cleanedIdeaJson, platformLabel, ragContext);
 
-        // STEP 4 — SAVE
+        String savedImageUrl = imageUrl;
+        boolean wantsImage = imageUrl == null && isImageRequested(finalInstruction);
+        if (wantsImage) {
+            try {
+                log.info("Generating AI image");
+                String dallePrompt = aiService.buildImagePrompt(generatedJson, platformLabel);
+                savedImageUrl = aiService.generateImage(dallePrompt);
+                log.info("Generated image saved: {}", savedImageUrl);
+            } catch (Exception ex) {
+                log.warn("Image generation failed: {}", ex.getMessage());
+            }
+        }
+
+        String parsedTitle = null, parsedSummary = null;
+        String parsedIntro = null, parsedBody = null, parsedClosing = null;
+        try {
+            String cleanJson = generatedJson
+                    .replaceAll("(?s)```json\\s*", "")
+                    .replaceAll("(?s)```\\s*", "").trim();
+            java.util.Map<String, Object> parsed = objectMapper.readValue(cleanJson, java.util.Map.class);
+            parsedTitle   = (String) parsed.get("title");
+            parsedSummary = (String) parsed.get("summary");
+            parsedIntro   = (String) parsed.get("intro");
+            parsedBody    = (String) parsed.get("body");
+            parsedClosing = (String) parsed.get("closing");
+        } catch (Exception ex) {
+            log.warn("Could not parse structured fields: {}", ex.getMessage());
+        }
+
         ContentItem item = ContentItem.builder()
                 .contentId(UUID.randomUUID().toString())
                 .rawInstruction(rawInstructionForStorage)
@@ -113,18 +230,21 @@ public class ContentService {
                 .platform(req.getPlatform())
                 .customPlatformName(req.getCustomPlatformName())
                 .generatedContent(generatedJson)
+                .title(parsedTitle)
+                .summary(parsedSummary)
+                .intro(parsedIntro)
+                .body(parsedBody)
+                .closing(parsedClosing)
+                .imageUrl(savedImageUrl)
+                .imageRequested(wantsImage)
                 .isGrouped(sameTopicGroup)
                 .status(ContentStatus.PENDING)
                 .build();
 
         contentItemRepository.save(item);
-        log.info("Saved to approval queue: contentId={}", item.getContentId());
+        log.info("Saved content: {}", item.getContentId());
         return item;
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // APPROVAL
-    // ─────────────────────────────────────────────────────────────────────────
 
     @Transactional
     public ContentItem processApproval(ContentApprovalRequest req)
@@ -133,108 +253,32 @@ public class ContentService {
         ContentItem item = findByContentId(req.getContentId());
 
         if (Boolean.TRUE.equals(req.getApproved())) {
-
-            if (req.getEditedContent() != null &&
-                    !req.getEditedContent().isBlank()) {
+            if (req.getEditedContent() != null && !req.getEditedContent().isBlank())
                 item.setEditedContent(req.getEditedContent());
-            }
-
-            if (req.getFeedback() != null) {
+            if (req.getFeedback() != null)
                 item.setAdminFeedback(req.getFeedback());
-            }
 
-            String contentToStore =
-                    (req.getEditedContent() != null &&
-                            !req.getEditedContent().isBlank())
-                            ? req.getEditedContent()
-                            : item.getGeneratedContent();
+            String contentToStore = (req.getEditedContent() != null
+                    && !req.getEditedContent().isBlank())
+                    ? req.getEditedContent()
+                    : item.getGeneratedContent();
 
-            String platform =
-                    item.getPlatform() != null
-                            ? item.getPlatform().name()
-                            : "GENERAL";
+            String platform = item.getPlatform() != null
+                    ? item.getPlatform().name() : "GENERAL";
 
-            log.info("Storing approved content into Qdrant: contentId={} platform={}",
-                    item.getContentId(), platform);
-
-            ingestionService.storeContent(
-                    item.getContentId(),
-                    contentToStore,
-                    platform);
-
+            ingestionService.storeContent(item.getContentId(), contentToStore, platform);
             item.setStatus(ContentStatus.APPROVED);
-            log.info("Content APPROVED: contentId={}", item.getContentId());
-
         } else {
-
             item.setStatus(ContentStatus.REJECTED);
             item.setAdminFeedback(req.getFeedback());
-            log.info("Content REJECTED: contentId={}", item.getContentId());
         }
 
         return contentItemRepository.save(item);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // PUBLISH
-    // ─────────────────────────────────────────────────────────────────────────
-
-    @Transactional
-    public PublishResult publish(PublishRequest req)
-            throws JsonProcessingException {
-
-        ContentItem item = findByContentId(req.getContentId());
-
-        Map<String, String> channelResults = new HashMap<>();
-
-        try {
-
-            ContentResult content = resolveContentForPublish(item);
-
-            if (item.getEditedContent() != null &&
-                    !item.getEditedContent().isBlank()) {
-                content.setBody(item.getEditedContent());
-            }
-
-            for (String channel : req.getChannels()) {
-
-                String result = dispatchChannel(
-                        channel.toUpperCase(), item, content);
-
-                channelResults.put(channel.toLowerCase(), result);
-                log.info("Channel={} result={}", channel, result);
-            }
-
-            item.setStatus(ContentStatus.PUBLISHED);
-            item.setPublishResults(objectMapper.writeValueAsString(channelResults));
-            item.setSelectedChannels(objectMapper.writeValueAsString(req.getChannels()));
-            contentItemRepository.save(item);
-
-            return PublishResult.builder()
-                    .contentId(item.getContentId())
-                    .success(true)
-                    .channelResults(channelResults)
-                    .message("Published to " + req.getChannels().size() + " channel(s)")
-                    .build();
-
-        } catch (Exception ex) {
-
-            log.error("Publish failed: contentId={}", item.getContentId(), ex);
-            item.setStatus(ContentStatus.FAILED);
-            contentItemRepository.save(item);
-
-            return PublishResult.builder()
-                    .contentId(item.getContentId())
-                    .success(false)
-                    .channelResults(channelResults)
-                    .message("Failed: " + ex.getMessage())
-                    .build();
-        }
+    public ContentItem getByContentId(String contentId) {
+        return findByContentId(contentId);
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // QUERIES
-    // ─────────────────────────────────────────────────────────────────────────
 
     public List<ContentItem> getPending() {
         return contentItemRepository.findByStatus(ContentStatus.PENDING);
@@ -244,435 +288,145 @@ public class ContentService {
         return contentItemRepository.findByStatus(ContentStatus.APPROVED);
     }
 
-    public List<ContentItem> getByPlatform(PlatformType p) {
-        return contentItemRepository.findByPlatform(p);
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // REASONING
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private static final String REASONING_SYSTEM = """
-    You are an expert content strategist for the CEO of AskOxy group.
-
-    Analyze ALL ideas in the input and extract:
-    - cleanedIdea: concise summary of everything
-    - keyPoints: the main ideas found
-    - tone: appropriate tone for the platform
-    - facts: factual claims to preserve exactly
-
-    TOPIC GROUPING RULE:
-    If ALL ideas belong to the SAME company and are related features,
-    updates, or aspects of the SAME business ecosystem → sameTopicGroup = true
-    If ideas belong to DIFFERENT companies OR completely unrelated topics → sameTopicGroup = false
-
-    Examples:
-      "proximity lending + instant approval + AI risk" all for OXY_LOANS → true
-      "OXY_LOANS feature" + "OXY_GOLD update" → false
-
-    STRICT RULES:
-    - Never invent anything
-    - Do not merge unrelated companies
-    - Output ONLY valid JSON, no markdown fences
-
-    Return exactly:
-    {
-      "cleanedIdea":"...",
-      "keyPoints":["..."],
-      "tone":"...",
-      "facts":["..."],
-      "sameTopicGroup": true,
-      "topicGroups":[{"groupName":"...","points":["..."]}]
-    }
-    """;
-
     private String reasonInstruction(String rawInstruction, String platformLabel) {
-
         String user = """
-            BUSINESS PLATFORM: %s
+                BUSINESS PLATFORM: %s
 
-            CEO RAW INPUT:
-            %s
-            """.formatted(platformLabel, rawInstruction);
-
-        String response = aiService.chat(REASONING_SYSTEM, user);
-        return cleanJson(response);
+                CEO RAW INPUT (may contain spelling mistakes from voice or typing):
+                %s
+                """.formatted(platformLabel, rawInstruction);
+        return cleanJson(aiService.chat(REASONING_SYSTEM, user));
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // GENERATION
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private static final String GENERATION_SYSTEM_GROUPED = """
-    You are the personal content writer for the CEO of AskOxy group.
-
-    The ideas are all part of the SAME business ecosystem.
-    Write ONE unified content piece with MULTIPLE SECTIONS.
-
-    Structure:
-    - One strong overall title
-    - An opening intro paragraph
-    - One section per key idea (heading + paragraph body)
-    - A closing paragraph tying everything together
-    - Shared hashtags and CTA at the end
-
-    STRICT RULES:
-    - CEO intent is the ONLY source of truth
-    - Use company KB facts only where directly relevant
-    - No hashtags inside body or sections
-    - Write professionally and clearly
-    - NEVER include labels like "USER INPUT", "ATTACHMENT CONTENT", "FILE SUMMARY" in output
-
-    Return ONLY valid JSON, no markdown:
-    {
-      "title":"",
-      "intro":"",
-      "sections":[{"heading":"","body":""}],
-      "closing":"",
-      "hashtags":"",
-      "callToAction":"",
-      "isGrouped":true
-    }
-    """;
-
-    private static final String GENERATION_SYSTEM_SEPARATE = """
-    You are the personal content writer for the CEO of AskOxy group.
-
-    The ideas belong to DIFFERENT topics or companies.
-    Generate SEPARATE content objects — one per distinct topic or company.
-
-    STRICT RULES:
-    - CEO intent is the ONLY source of truth
-    - Each content piece must stand alone completely
-    - No hashtags inside body
-    - Write professionally and clearly
-    - NEVER include labels like "USER INPUT", "ATTACHMENT CONTENT", "FILE SUMMARY" in output
-
-    Return ONLY valid JSON array, no markdown:
-    [
-      {"title":"","body":"","hashtags":"","callToAction":""},
-      {"title":"","body":"","hashtags":"","callToAction":""}
-    ]
-    """;
-
-    private String generateGroupedContent(
-            String cleanedIdeaJson,
-            String platformLabel,
-            String ragContext) {
-
-        String user = """
-        BUSINESS PLATFORM: %s
-
-        CEO STRUCTURED IDEA:
-        %s
-
-        %s COMPANY KNOWLEDGE BASE (verified facts only):
-        %s
-        """.formatted(
-                platformLabel,
-                cleanedIdeaJson,
-                platformLabel,
-                ragContext.isBlank() ? "No relevant knowledge found." : ragContext);
-
-        String response = aiService.chat(GENERATION_SYSTEM_GROUPED, user);
-        log.info("RAW AI RESPONSE (GROUPED):\n{}", response);
-        return cleanJson(response);
-    }
-
-    private String generateSeparateContent(
-            String cleanedIdeaJson,
-            String platformLabel,
-            String ragContext) {
-
-        String user = """
-        BUSINESS PLATFORM: %s
-
-        CEO STRUCTURED IDEA:
-        %s
-
-        %s COMPANY KNOWLEDGE BASE (verified facts only):
-        %s
-        """.formatted(
-                platformLabel,
-                cleanedIdeaJson,
-                platformLabel,
-                ragContext.isBlank() ? "No relevant knowledge found." : ragContext);
-
-        String response = aiService.chat(GENERATION_SYSTEM_SEPARATE, user);
-        log.info("RAW AI RESPONSE (SEPARATE):\n{}", response);
-        return cleanJson(response);
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // RAG — PLATFORM FILTERED
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private String retrieve(String query, int topK, String platformLabel) {
-
-        try {
-            SearchRequest.Builder builder = SearchRequest.builder()
-                    .query(query)
-                    .topK(topK);
-
-            if (platformLabel != null && !platformLabel.isBlank()) {
-                builder.filterExpression("clientName == '" + platformLabel + "'");
-                log.info("RAG filter applied: clientName={}", platformLabel);
-            }
-
-            var docs = vectorStore.similaritySearch(builder.build());
-            log.info("RAG returned {} chunks for platform={}", docs.size(), platformLabel);
-
-            return String.join(
-                    "\n\n",
-                    docs.stream()
-                            .map(org.springframework.ai.document.Document::getText)
-                            .toList());
-
-        } catch (Exception ex) {
-            log.warn("RAG retrieval failed for platform={} — continuing without KB", platformLabel, ex);
-            return "";
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // CLASSIFIER HELPER
-    // ─────────────────────────────────────────────────────────────────────────
 
     private boolean extractSameTopicGroup(String reasoningJson) {
         try {
             return objectMapper.readTree(cleanJson(reasoningJson))
-                    .path("sameTopicGroup")
-                    .asBoolean(false);
+                    .path("sameTopicGroup").asBoolean(false);
         } catch (Exception ex) {
-            log.warn("Could not parse sameTopicGroup — defaulting to false");
             return false;
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // RESOLVE CONTENT FOR PUBLISH
-    // ─────────────────────────────────────────────────────────────────────────
+    private String retrieveWithFallback(String query, int topK, String platformLabel) {
+        List<Document> combined = new ArrayList<>();
 
-    private ContentResult resolveContentForPublish(ContentItem item) {
-
-        String json = item.getGeneratedContent();
-
-        // GROUPED
-        if (Boolean.TRUE.equals(item.getIsGrouped())) {
+        if (platformLabel != null && !platformLabel.isBlank()) {
             try {
-                ContentResult grouped = objectMapper.readValue(json, ContentResult.class);
-
-                if (grouped.getSections() != null && !grouped.getSections().isEmpty()) {
-                    StringBuilder flatBody = new StringBuilder();
-                    if (grouped.getIntro() != null)
-                        flatBody.append(grouped.getIntro()).append("\n\n");
-                    for (ContentSection section : grouped.getSections()) {
-                        flatBody.append(section.getHeading()).append("\n");
-                        flatBody.append(section.getBody()).append("\n\n");
-                    }
-                    if (grouped.getClosing() != null)
-                        flatBody.append(grouped.getClosing());
-                    grouped.setBody(flatBody.toString().trim());
-                }
-                return grouped;
-
+                List<Document> scoped = vectorStore.similaritySearch(
+                        SearchRequest.builder()
+                                .query(query)
+                                .topK(topK / 2 + 1)
+                                .filterExpression("clientName == '" + platformLabel + "'")
+                                .build());
+                combined.addAll(scoped);
+                log.info("Content RAG Pass-1 (platform={}) → {} docs", platformLabel, scoped.size());
             } catch (Exception ex) {
-                log.warn("Could not parse grouped content, using raw body");
-                return ContentResult.builder().body(json).build();
+                log.warn("Content RAG Pass-1 failed: {}", ex.getMessage());
             }
         }
 
-        // SEPARATE ARRAY
-        if (json.trim().startsWith("[")) {
-            try {
-                List<ContentResult> list = objectMapper.readValue(
-                        json,
-                        objectMapper.getTypeFactory()
-                                .constructCollectionType(List.class, ContentResult.class));
-
-                if (!list.isEmpty()) {
-                    StringBuilder merged = new StringBuilder();
-                    for (ContentResult cr : list) {
-                        if (cr.getTitle() != null) merged.append(cr.getTitle()).append("\n");
-                        if (cr.getBody() != null)  merged.append(cr.getBody()).append("\n\n");
-                    }
-                    return ContentResult.builder()
-                            .title(list.get(0).getTitle())
-                            .body(merged.toString().trim())
-                            .hashtags(list.get(0).getHashtags())
-                            .callToAction(list.get(0).getCallToAction())
-                            .build();
-                }
-            } catch (Exception ex) {
-                log.warn("Could not parse array content, using raw body");
-            }
-            return ContentResult.builder().body(json).build();
-        }
-
-        // FLAT SINGLE
         try {
-            return objectMapper.readValue(json, ContentResult.class);
+            List<Document> broad = vectorStore.similaritySearch(
+                    SearchRequest.builder().query(query).topK(topK).build());
+            combined.addAll(broad);
+            log.info("Content RAG Pass-2 (broad) → {} docs", broad.size());
         } catch (Exception ex) {
-            log.warn("Could not parse flat content, using raw body");
-            return ContentResult.builder().body(json).build();
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // CHANNEL DISPATCH
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private String dispatchChannel(
-            String channel,
-            ContentItem item,
-            ContentResult content) {
-
-        if (n8nEnabled) {
-            return fireN8nWebhook(channel.toLowerCase(), item, content);
+            log.warn("Content RAG Pass-2 failed: {}", ex.getMessage());
         }
 
-        return switch (channel) {
-            case "LINKEDIN"  -> "QUEUED";
-            case "INSTAGRAM" -> "QUEUED";
-            case "BLOG"      -> "QUEUED";
-            case "EMAIL"     -> "QUEUED";
-            case "WHATSAPP"  -> "QUEUED";
-            default          -> "SKIPPED";
-        };
+        return combined.stream()
+                .collect(Collectors.toMap(
+                        d -> d.getId() != null ? d.getId() : d.getText(),
+                        d -> d,
+                        (existing, replacement) -> existing))
+                .values().stream()
+                .limit(topK)
+                .map(Document::getText)
+                .collect(Collectors.joining("\n\n"));
     }
 
-    private String fireN8nWebhook(
-            String channel,
-            ContentItem item,
-            ContentResult content) {
+    private String generateGroupedContent(String cleanedIdeaJson, String platformLabel, String ragContext) {
+        String user = """
+                PLATFORM: %s
 
-        String url = n8nWebhookBaseUrl + "/" + channel;
+                CEO IDEA (spelling already corrected):
+                %s
 
-        try {
-            RestTemplate restTemplate = new RestTemplate();
-
-            Map<String, Object> payload = new HashMap<>();
-            payload.put("contentId",          item.getContentId());
-            payload.put("channel",            channel.toUpperCase());
-            payload.put("platform",           item.getPlatform());
-            payload.put("customPlatformName", item.getCustomPlatformName());
-            payload.put("title",              content.getTitle());
-            payload.put("body",               content.getBody());
-            payload.put("hashtags",           content.getHashtags());
-            payload.put("callToAction",       content.getCallToAction());
-
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.APPLICATION_JSON);
-
-            ResponseEntity<String> response = restTemplate.postForEntity(
-                    url, new HttpEntity<>(payload, headers), String.class);
-
-            return response.getStatusCode().is2xxSuccessful()
-                    ? "N8N_TRIGGERED"
-                    : "N8N_ERROR";
-
-        } catch (Exception ex) {
-            return "N8N_FAILED";
-        }
+                KNOWLEDGE BASE CONTEXT:
+                %s
+                """.formatted(platformLabel, cleanedIdeaJson, ragContext);
+        return cleanJson(aiService.chat(GENERATION_SYSTEM_GROUPED, user));
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // HELPERS
-    // ─────────────────────────────────────────────────────────────────────────
+    private String generateSeparateContent(String cleanedIdeaJson, String platformLabel, String ragContext) {
+        String user = """
+                PLATFORM: %s
 
-    private String resolvePlatformLabel(
-            PlatformType platform,
-            String customPlatformName) {
+                CEO IDEA (spelling already corrected):
+                %s
 
-        if (platform == PlatformType.OTHER &&
-                customPlatformName != null &&
-                !customPlatformName.isBlank()) {
-            return customPlatformName.trim();
-        }
-
-        return platform != null ? platform.name() : "ASK_OXY_AI";
+                KNOWLEDGE BASE CONTEXT:
+                %s
+                """.formatted(platformLabel, cleanedIdeaJson, ragContext);
+        return cleanJson(aiService.chat(GENERATION_SYSTEM_SEPARATE, user));
     }
 
-    private String normalizeText(String text) {
-        if (text == null) return "";
-        return text
-                .replaceAll("\r\n", "\n")
-                .replaceAll("\r", "\n")
-                .replaceAll("[ \t]+", " ")
-                .replaceAll("\n{3,}", "\n\n")
-                .trim();
-    }
-
-    // ── Smart File Summarizer — AI reads file, returns key facts only ─────────
     private String smartSummarizeFile(MultipartFile file) {
         String rawText = extractAttachment(file);
         if (rawText.isBlank()) return "";
-
-        String prompt = """
-                You are reading a CEO's reference document.
-                Extract ONLY the key business facts needed to write great content.
-                
-                Rules:
-                - You decide how many bullet points are needed — not too few, not too many
-                - Include: what this product/service is, key features, important numbers, target audience
-                - Skip: boilerplate, legal text, repeated info, technical jargon
-                - If document is short, keep summary short
-                - If document has many facts, cover all important ones
-                - No headings. No "the document says". Just clean bullet points.
-                """;
-
-        return aiService.chat(prompt, rawText.substring(0, Math.min(rawText.length(), 5000)));
+        return aiService.chat(
+                "Extract key business facts only. Fix any spelling or grammar mistakes.",
+                rawText.substring(0, Math.min(rawText.length(), 5000)));
     }
 
     private String extractAttachment(MultipartFile file) {
         try {
-            String name = file.getOriginalFilename();
-            if (name == null) return "";
-            name = name.toLowerCase();
-
+            if (file.getOriginalFilename() == null) return "";
+            String name = file.getOriginalFilename().toLowerCase();
             String extracted = "";
-
-            // DOCUMENTS
-            if (name.endsWith(".pdf")
-                    || name.endsWith(".docx")
-                    || name.endsWith(".txt")) {
+            if (name.endsWith(".pdf") || name.endsWith(".docx") || name.endsWith(".txt"))
                 extracted = documentService.extractText(file);
-            }
-            // IMAGES
-            else if (name.endsWith(".png")
-                    || name.endsWith(".jpg")
-                    || name.endsWith(".jpeg")
-                    || name.endsWith(".webp")) {
+            else if (name.endsWith(".png") || name.endsWith(".jpg")
+                    || name.endsWith(".jpeg") || name.endsWith(".webp"))
                 extracted = aiService.extractImageText(file);
-            }
-            // AUDIO
-            else if (name.endsWith(".mp3")
-                    || name.endsWith(".wav")
-                    || name.endsWith(".m4a")
-                    || name.endsWith(".aac")) {
+            else if (name.endsWith(".mp3") || name.endsWith(".wav")
+                    || name.endsWith(".m4a") || name.endsWith(".aac"))
                 extracted = aiService.transcribe(file);
-            }
-
-            return extracted
-                    .replaceAll("\\s+", " ")
-                    .replaceAll("[^\\x20-\\x7E\\n]", "")
-                    .trim();
-
+            return extracted.replaceAll("\\s+", " ")
+                    .replaceAll("[^\\x20-\\x7E\\n]", "").trim();
         } catch (Exception ex) {
             return "";
         }
     }
 
     private ContentItem findByContentId(String contentId) {
-        return contentItemRepository
-                .findByContentId(contentId)
-                .orElseThrow(() ->
-                        new RuntimeException("Content not found: " + contentId));
+        return contentItemRepository.findByContentId(contentId)
+                .orElseThrow(() -> new RuntimeException("Content not found: " + contentId));
+    }
+
+    private String resolvePlatformLabel(PlatformType platform, String customPlatformName) {
+        if (platform == PlatformType.OTHER && customPlatformName != null
+                && !customPlatformName.isBlank())
+            return customPlatformName.trim();
+        return platform != null ? platform.name() : "ASK_OXY_AI";
+    }
+
+    private String normalizeText(String text) {
+        if (text == null) return "";
+        return text.replaceAll("\r\n", "\n").replaceAll("\r", "\n")
+                .replaceAll("[ \t]+", " ").replaceAll("\n{3,}", "\n\n").trim();
+    }
+
+    private boolean isImageRequested(String instruction) {
+        if (instruction == null) return false;
+        String lower = instruction.toLowerCase();
+        return lower.contains("with image") || lower.contains("generate image")
+                || lower.contains("create image") || lower.contains("add image")
+                || lower.contains("include image") || lower.contains("image post")
+                || lower.contains("with picture") || lower.contains("with photo");
     }
 
     private String cleanJson(String s) {
-        return s.replaceAll("```json", "")
-                .replaceAll("```", "")
-                .trim();
+        return s.replaceAll("```json", "").replaceAll("```", "").trim();
     }
 }

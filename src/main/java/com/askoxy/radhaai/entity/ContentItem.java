@@ -20,7 +20,6 @@ public class ContentItem extends BaseEntity {
     @Column(columnDefinition = "TEXT", nullable = false)
     private String rawInstruction;
 
-    /** Combined clean inputs: text + voice transcript + AI file summary */
     @Column(columnDefinition = "TEXT")
     private String extractedInputs;
 
@@ -37,6 +36,21 @@ public class ContentItem extends BaseEntity {
     @Column(columnDefinition = "TEXT")
     private String editedContent;
 
+    @Column(columnDefinition = "TEXT")
+    private String title;
+
+    @Column(columnDefinition = "TEXT")
+    private String summary;
+
+    @Column(columnDefinition = "TEXT")
+    private String intro;
+
+    @Column(columnDefinition = "TEXT")
+    private String body;
+
+    @Column(columnDefinition = "TEXT")
+    private String closing;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     private ContentStatus status;
@@ -52,4 +66,26 @@ public class ContentItem extends BaseEntity {
 
     @Column(name = "is_grouped")
     private Boolean isGrouped = false;
+
+    @Column(columnDefinition = "TEXT")
+    private String imageUrl;
+
+    @Column
+    private Boolean imageRequested = false;
+
+    @Column(columnDefinition = "TEXT")
+    private String imageFileUrl;
+
+    @Column(columnDefinition = "TEXT")
+    private String videoUrl;
+
+    @Column(columnDefinition = "TEXT")
+    private String videoFileUrl;
+
+    @Builder.Default
+    @Column
+    private Boolean blogPublished = false;
+
+    @Column(columnDefinition = "TEXT")
+    private String blogFormat;      // ← ADDED
 }

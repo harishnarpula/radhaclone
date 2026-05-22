@@ -1,11 +1,15 @@
 package com.askoxy.radhaai.controller;
 
+import com.askoxy.radhaai.service.ContentFormatterService;
+import com.askoxy.radhaai.dto.FormatRequest;
+import com.askoxy.radhaai.dto.FormatResponse;
 import com.askoxy.radhaai.dto.*;
 import com.askoxy.radhaai.entity.ContentItem;
+import com.askoxy.radhaai.entity.VideoContent;
 import com.askoxy.radhaai.enums.PlatformType;
 import com.askoxy.radhaai.service.ContentService;
 import com.askoxy.radhaai.service.IngestionService;
-import com.fasterxml.jackson.core.JsonProcessingException;
+import com.askoxy.radhaai.service.VideoService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
@@ -13,13 +17,6 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 
-/**
- * Merged controller — handles:
- * 1. Company knowledge ingestion
- * 2. AI content generation
- * 3. Approval workflow
- * 4. Publishing workflow
- */
 @RestController
 @RequiredArgsConstructor
 @RequestMapping("/api/v1")
@@ -27,68 +24,25 @@ public class ContentController {
 
     private final ContentService contentService;
     private final IngestionService ingestionService;
+    private final ContentFormatterService formatterService;
+    private final VideoService videoService;
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // COMPANY KNOWLEDGE UPLOAD
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── COMPANY UPLOAD ────────────────────────────────────────────────────────
 
-    /**
-     * Upload company knowledge:
-     * - PDF
-     * - DOCX
-     * - PPT
-     * - Excel
-     * - CSV
-     * - TXT
-     * - HTML
-     * etc.
-     *
-     * This ONLY stores knowledge into Qdrant.
-     * No AI generation happens here.
-     */
-    @PostMapping(
-            value = "/upload/company",
-            consumes = MediaType.MULTIPART_FORM_DATA_VALUE
-    )
+    @PostMapping(value = "/upload/company", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ApiResponse<UploadResponse> uploadCompanyKnowledge(
             @RequestParam("file") MultipartFile file,
             @RequestParam PlatformType platformType,
             @RequestParam(required = false) String description) {
 
-        // LARGE FILE LIMIT
-        if (file.getSize() > 200 * 1024 * 1024) {
-
-            throw new RuntimeException(
-                    "Company upload too large. Max allowed size is 200MB.");
-        }
-
-        return ApiResponse.success(
-                ingestionService.upload(
-                        file,
-                        platformType,
-                        description));
+        if (file.getSize() > 200 * 1024 * 1024)
+            throw new RuntimeException("Company upload too large. Max allowed size is 200MB.");
+        return ApiResponse.success(ingestionService.upload(file, platformType, description));
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // CONTENT SUBMIT
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── CONTENT SUBMIT ────────────────────────────────────────────────────────
 
-    /**
-     * CEO/admin daily content generation API.
-     *
-     * Supports:
-     * - text
-     * - voice
-     * - image
-     * - audio
-     * - PDF
-     * - DOCX
-     * - screenshots
-     */
-    @PostMapping(
-            value = "/content/submit",
-            consumes = MediaType.MULTIPART_FORM_DATA_VALUE
-    )
+    @PostMapping(value = "/content/submit", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ApiResponse<ContentItem> submitInstruction(
             @RequestParam(required = false) String rawInstruction,
             @RequestParam(required = false) PlatformType platform,
@@ -97,22 +51,12 @@ public class ContentController {
             @RequestPart(required = false) MultipartFile attachment)
             throws Exception {
 
-        // VALIDATION
         if ((rawInstruction == null || rawInstruction.isBlank())
-                && voiceFile == null
-                && attachment == null) {
+                && voiceFile == null && attachment == null)
+            throw new RuntimeException("Please provide text, voice, or attachment.");
 
-            throw new RuntimeException(
-                    "Please provide text, voice, or attachment.");
-        }
-
-        // SMALL TEMP FILE LIMIT
-        if (attachment != null &&
-                attachment.getSize() > 10 * 1024 * 1024) {
-
-            throw new RuntimeException(
-                    "Attachment too large for content generation. Max allowed size is 10MB.");
-        }
+        if (attachment != null && attachment.getSize() > 10 * 1024 * 1024)
+            throw new RuntimeException("Attachment too large. Max allowed size is 10MB.");
 
         return ApiResponse.success(
                 contentService.submit(
@@ -127,60 +71,103 @@ public class ContentController {
         );
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // APPROVALS
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── CONTENT APPROVALS ─────────────────────────────────────────────────────
 
     @GetMapping("/content/pending")
     public ApiResponse<List<ContentItem>> getPendingApprovals() {
-
-        return ApiResponse.success(
-                contentService.getPending());
+        return ApiResponse.success(contentService.getPending());
     }
 
     @GetMapping("/content/approved")
     public ApiResponse<List<ContentItem>> getApprovedContent() {
-
-        return ApiResponse.success(
-                contentService.getApproved());
+        return ApiResponse.success(contentService.getApproved());
     }
 
-    @PostMapping("/content/approve")
-    public ApiResponse<ContentItem> processApproval(
-            @RequestBody ContentApprovalRequest request)
-            throws JsonProcessingException {
-
-        return ApiResponse.success(
-                contentService.processApproval(request));
+    @GetMapping("/content/{contentId}")
+    public ApiResponse<ContentItem> getById(@PathVariable String contentId) {
+        return ApiResponse.success(contentService.getByContentId(contentId));
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // PUBLISH
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── FORMAT — handles both VIDEO and CONTENT ───────────────────────────────
 
-    @PostMapping("/content/publish")
-    public ApiResponse<PublishResult> publishContent(
-            @RequestBody PublishRequest request)
-            throws JsonProcessingException {
+    @PostMapping("social/format")
+    public ApiResponse<FormatResponse> format(@RequestBody FormatRequest request) {
+
+        String content;
+        String imageUrl = null;
+        String videoUrl = null;
+
+        if ("VIDEO".equalsIgnoreCase(request.getEntityType())) {
+            VideoContent video = videoService.findById(request.getEntityId());
+            content  = video.getApprovedContent() != null ? video.getApprovedContent() : video.getReasonedContent();
+            imageUrl = video.getThumbnailUrl();
+            videoUrl = video.getStoragePath();
+        } else {
+            ContentItem item = contentService.getByContentId(request.getEntityId());
+            content  = item.getEditedContent() != null ? item.getEditedContent() : item.getGeneratedContent();
+            imageUrl = item.getImageUrl();
+        }
 
         return ApiResponse.success(
-                contentService.publish(request));
+                formatterService.format(content, imageUrl, videoUrl, request.getPlatforms())
+        );
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // FILTERS
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── VIDEO SUBMIT ──────────────────────────────────────────────────────────
 
-    @GetMapping("/content/platform/{platform}")
-    public ApiResponse<List<ContentItem>> getByPlatform(
-            @PathVariable String platform) {
+    @PostMapping(value = "/video/submit", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ApiResponse<VideoContent> videoSubmit(
+            @RequestPart("videoFile") MultipartFile videoFile) throws Exception {
+        if (videoFile.isEmpty())
+            throw new RuntimeException("Please upload a video file.");
+        if (videoFile.getContentType() == null || !videoFile.getContentType().startsWith("video/"))
+            throw new RuntimeException("Please upload a valid video file (mp4, mov, avi).");
+        return ApiResponse.success(videoService.submit(videoFile));
+    }
 
+    @GetMapping("/video/all")
+    public ApiResponse<List<VideoContent>> getAllVideos() {
+        return ApiResponse.success(videoService.getAll());
+    }
+
+    // ── SHARED ACTIONS (video + content both use these) ───────────────────────
+
+    @PostMapping("/add-to-clone")
+    public ApiResponse<Object> addToClone(@RequestBody CloneApprovalRequest request) {
+        return ApiResponse.success(videoService.addToClone(request));
+    }
+
+    @PostMapping("/social/post")
+    public ApiResponse<SocialPostResult> postToSocial(
+            @RequestBody SocialPostRequest request) {
+        return ApiResponse.success(videoService.postToSocial(request));
+    }
+
+    // ── BLOG ──────────────────────────────────────────────────────────────────
+
+    @PostMapping("/blog/format")
+    public ApiResponse<BlogFormatResult> formatForBlog(@RequestBody BlogFormatRequest request) {
         return ApiResponse.success(
-                contentService.getByPlatform(
-                        PlatformType.valueOf(
-                                platform.toUpperCase()
-                        )
+                videoService.formatForBlog(
+                        request.getEntityId(),
+                        request.getEntityType(),
+                        request.isGenerateImage()
                 )
         );
+    }
+
+    @PostMapping("/image/{id}")
+    public ApiResponse<BlogFormatResult> generateImage(
+            @PathVariable String id,
+            @RequestParam String entityType) {
+
+        return ApiResponse.success(
+                videoService.generateBlogImage(id, entityType)
+        );
+    }
+
+    @PostMapping("/blog/publish")
+    public ApiResponse<BlogFormatResult> publishBlog(@RequestBody BlogFormatResult blogResult) {
+        return ApiResponse.success(videoService.publishBlog(blogResult));
     }
 }

@@ -21,6 +21,7 @@ import org.apache.poi.xslf.usermodel.*;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.apache.poi.xwpf.extractor.XWPFWordExtractor;
 import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import lombok.RequiredArgsConstructor;
 import org.jsoup.Jsoup;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -35,7 +36,11 @@ import java.util.List;
 
 @Slf4j
 @Service
+@RequiredArgsConstructor
 public class DocumentService {
+
+    // AIService injected for IMAGE (GPT-4 Vision) and AUDIO (Whisper) extraction
+    private final AIService aiService;
 
     // ─────────────────────────────────────────────────────────────────────────
     // CHUNKING CONFIG
@@ -225,9 +230,9 @@ public class DocumentService {
 
                 case RTF -> extractRtf(file);
 
-                case IMAGE -> "[IMAGE FILE]";
+                case IMAGE -> extractImageContent(file);
 
-                case AUDIO -> "[AUDIO FILE]";
+                case AUDIO -> extractAudioContent(file);
 
                 default -> extractFallback(file);
             };
@@ -853,5 +858,41 @@ public class DocumentService {
         return pieces.isEmpty()
                 ? List.of(text)
                 : pieces;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // IMAGE — GPT-4 Vision reads all visible text, banners, marketing content
+    // Used ONLY by company upload API. No other flow affected.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private String extractImageContent(MultipartFile file) {
+        try {
+            log.info("Extracting image via GPT-4 Vision: {}", file.getOriginalFilename());
+            String text = aiService.extractImageText(file);
+            return (text != null && !text.isBlank())
+                    ? text
+                    : "[Image uploaded — no readable text detected]";
+        } catch (Exception ex) {
+            log.error("Image extraction failed: {}", ex.getMessage());
+            return "[Image extraction failed: " + file.getOriginalFilename() + "]";
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // AUDIO — Whisper transcribes full speech content
+    // Used ONLY by company upload API. No other flow affected.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private String extractAudioContent(MultipartFile file) {
+        try {
+            log.info("Transcribing audio via Whisper: {}", file.getOriginalFilename());
+            String text = aiService.transcribe(file);
+            return (text != null && !text.isBlank())
+                    ? text
+                    : "[Audio uploaded — no speech detected]";
+        } catch (Exception ex) {
+            log.error("Audio transcription failed: {}", ex.getMessage());
+            return "[Audio transcription failed: " + file.getOriginalFilename() + "]";
+        }
     }
 }

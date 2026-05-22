@@ -17,4 +17,6 @@ public class ContentResult {
     private List<ContentSection> sections;
     private String closing;
     private Boolean isGrouped;
+    private String summary;
+
 }

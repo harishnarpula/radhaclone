@@ -11,42 +11,44 @@ spring:
   jpa:
     hibernate:
       ddl-auto: update
-
     show-sql: false
     open-in-view: false
-
-    properties:
-      hibernate:
-        dialect: org.hibernate.dialect.PostgreSQLDialect
 
   servlet:
     multipart:
       max-file-size: 500MB
       max-request-size: 500MB
 
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: siddushiva2699@gmail.com
+    password: upzw endy nhuu htag
+
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+
   ai:
-    # Anthropic DISABLED — no credits
     anthropic:
       api-key: DISABLED
-
-    # OpenAI — used for BOTH chat AND embeddings
     openai:
       api-key: ${OPENAI_API_KEY}
       chat:
         options:
-          model: gpt-4o-mini
+          model: gpt-4.1-mini
           max-tokens: 4096
       embedding:
         options:
           model: text-embedding-3-small
-
     vectorstore:
       qdrant:
         host: ${QDRANT_HOST}
         port: ${QDRANT_PORT}
         api-key: ${QDRANT_API_KEY}
-        collection-name: askoxy
+        collection-name: askoxy_live
         use-tls: true
+
 
 management:
   health:
@@ -57,7 +59,15 @@ logging:
   level:
     com.askoxy.radhaai: INFO
 
+
 radha:
+  email:
+    from: siddushiva2699@gmail.com
+    to: bsudheesh123@gmail.com
   n8n:
-    enabled: false
-    webhook-base-url: http://localhost:5678/webhook
+    enabled: true
+    webhook-base-url: http://localhost:5678/webhook-test
+
+gemini:
+  api:
+    key: AIzaSyCtOA1KiqxAGhb71srDoLz5KBp97fHuTeI
