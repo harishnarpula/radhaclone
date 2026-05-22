@@ -1,5 +1,6 @@
 server:
   port: 8080
+  forward-headers-strategy: framework
 
 spring:
   datasource:
@@ -48,6 +49,9 @@ spring:
         api-key: ${QDRANT_API_KEY}
         collection-name: askoxy_live
         use-tls: true
+
+
+
 
 
 management:
